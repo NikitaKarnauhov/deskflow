@@ -8,6 +8,7 @@
 #include "server/PrimaryClient.h"
 
 #include "base/Log.h"
+#include "deskflow/IPlatformScreen.h"
 #include "deskflow/Screen.h"
 //
 // PrimaryClient
@@ -132,6 +133,11 @@ void PrimaryClient::grabClipboard(ClipboardID id)
 
   // clipboard is dirty (because someone else owns it now)
   m_clipboardDirty[id] = true;
+}
+
+bool PrimaryClient::clipboardSyncIsAsync() const
+{
+  return m_screen->getPlatformScreen()->clipboardSyncIsAsync();
 }
 
 void PrimaryClient::setClipboardDirty(ClipboardID id, bool dirty)

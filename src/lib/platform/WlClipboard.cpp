@@ -8,11 +8,15 @@
 
 #include "base/Log.h"
 
+#include <cerrno>
+#include <chrono>
+#include <csignal>
 #include <fcntl.h>
 #include <poll.h>
 #include <spawn.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <vector>
 
 #include <QDateTime>
 #include <QProcess>
@@ -38,9 +42,88 @@ inline static const auto s_mimeTypeBmp = QStringLiteral("image/bmp");
 const char *const s_mimeTypeHtmlUtf8 = "text/html;charset=UTF-8";
 const char *const s_mimeTypeHtmlWindows = "HTML Format";
 
-// Command timeout (milliseconds)
-const int kCacheValidityMs = 100;
+// Cache validity (milliseconds). The background sync worker refreshes the
+// cache on every screen leave, so a long validity just means "the cache is
+// good until the next leave" and keeps has()/get() from spawning wl-paste.
+const int kCacheValidityMs = 10 * 60 * 1000;
 const int kProcessTimeoutMs = 2000;
+
+// Run a command to completion and capture its standard output.
+//
+// Uses only POSIX APIs (no Qt), so it is safe to call from any thread,
+// in particular the background clipboard sync worker.
+bool runToolCapture(const std::vector<std::string> &argv, int timeoutMs, std::string &out)
+{
+  int pipeFds[2];
+  if (pipe(pipeFds) != 0) {
+    return false;
+  }
+
+  int devnull = open("/dev/null", O_WRONLY);
+  posix_spawn_file_actions_t actions;
+  posix_spawn_file_actions_init(&actions);
+  posix_spawn_file_actions_adddup2(&actions, pipeFds[1], STDOUT_FILENO);
+  if (devnull >= 0) {
+    posix_spawn_file_actions_adddup2(&actions, devnull, STDERR_FILENO);
+  }
+  posix_spawn_file_actions_destroy(&actions);
+  if (devnull >= 0) {
+    close(devnull);
+  }
+
+  std::vector<char *> args;
+  args.reserve(argv.size() + 1);
+  for (const auto &arg : argv) {
+    args.push_back(const_cast<char *>(arg.c_str()));
+  }
+  args.push_back(nullptr);
+
+  pid_t pid = -1;
+  bool ok = false;
+  if (posix_spawn(&pid, argv[0].c_str(), &actions, nullptr, args.data(), environ) == 0) {
+    close(pipeFds[1]);
+    pipeFds[1] = -1;
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    for (;;) {
+      struct pollfd pfd;
+      pfd.fd = pipeFds[0];
+      pfd.events = POLLIN;
+      pfd.revents = 0;
+
+      const int pollResult = poll(&pfd, 1, 200);
+      if (pollResult > 0) {
+        char buffer[8192];
+        const ssize_t bytes = read(pipeFds[0], buffer, sizeof(buffer));
+        if (bytes > 0) {
+          out.append(buffer, static_cast<size_t>(bytes));
+        } else if (bytes == 0) {
+          break; // EOF
+        } else if (errno != EINTR) {
+          break; // read error
+        }
+      } else if (pollResult < 0 && errno != EINTR) {
+        break;
+      }
+
+      if (std::chrono::steady_clock::now() > deadline) {
+        ::kill(pid, SIGKILL);
+        break;
+      }
+    }
+    ok = true;
+
+    int status = 0;
+    waitpid(pid, &status, 0);
+  }
+
+  if (pipeFds[1] >= 0) {
+    close(pipeFds[1]);
+  }
+  close(pipeFds[0]);
+  return ok;
+}
+
 } // namespace
 
 WlClipboard::WlClipboard(ClipboardID id) : m_id(id), m_useClipboard(id == kClipboardClipboard)
@@ -50,9 +133,9 @@ WlClipboard::WlClipboard(ClipboardID id) : m_id(id), m_useClipboard(id == kClipb
     m_cachedAvailable[i] = false;
   }
 
-  // Seed the known type list so the first refreshTypes() only reports
+  // Seed the known type list so the first background check only reports
   // an actual change
-  updateTypes(false);
+  checkChangePosix();
 }
 
 WlClipboard::~WlClipboard() = default;
@@ -67,15 +150,79 @@ bool WlClipboard::isAvailable()
   return !QStandardPaths::findExecutable(s_copyApp).isEmpty() && !QStandardPaths::findExecutable(s_pasteApp).isEmpty();
 }
 
-bool WlClipboard::refreshTypes()
+bool WlClipboard::checkChangePosix()
 {
-  updateTypes(true);
-  return m_hasChanged.load();
+  std::string raw;
+  std::vector<std::string> argv = {s_pasteApp.toStdString(), s_listTypes.toStdString()};
+  if (!m_useClipboard) {
+    argv.push_back(s_isPrimary.toStdString());
+  }
+
+  if (!runToolCapture(argv, kProcessTimeoutMs, raw)) {
+    return false;
+  }
+
+  QStringList current;
+  const static QChar newLine = QLatin1Char('\n');
+  for (const auto &line : QString::fromLocal8Bit(raw).split(newLine)) {
+    if (!line.isEmpty()) {
+      current.append(line);
+    }
+  }
+
+  bool changed;
+  {
+    std::scoped_lock<std::mutex> lock(m_cacheMutex);
+    changed = (current != m_lastTypes);
+    m_lastTypes = current;
+
+    if (changed) {
+      // Drop stale data, then re-derive format availability
+      invalidateCache();
+      updateOwnership(false);
+    }
+
+    // Refresh the availability cache so has()/get() don't have to spawn
+    applyTypes(current);
+    m_cached = true;
+    m_cachedTime = getCurrentTime();
+  }
+
+  return changed;
 }
 
-bool WlClipboard::hasChanged() const
+bool WlClipboard::readPosix(Format format, std::string &data)
 {
-  return m_hasChanged.load();
+  const auto mimeType = formatToMimeType(format);
+  if (mimeType.isEmpty()) {
+    return false;
+  }
+
+  std::vector<std::string> argv = {
+      s_pasteApp.toStdString(),
+      s_noNewLine.toStdString(),
+      s_readType.arg(mimeType).toStdString()
+  };
+  if (!m_useClipboard) {
+    argv.push_back(s_isPrimary.toStdString());
+  }
+
+  return runToolCapture(argv, kProcessTimeoutMs, data);
+}
+
+void WlClipboard::storeData(Format format, const std::string &data)
+{
+  std::scoped_lock<std::mutex> lock(m_cacheMutex);
+  m_cachedData[static_cast<int>(format)] = data;
+  m_cachedAvailable[static_cast<int>(format)] = !data.empty();
+  m_cached = true;
+  m_cachedTime = getCurrentTime();
+}
+
+std::string WlClipboard::getCachedData(Format format) const
+{
+  std::scoped_lock<std::mutex> lock(m_cacheMutex);
+  return m_cachedData[static_cast<int>(format)];
 }
 
 bool WlClipboard::empty()
@@ -122,9 +269,14 @@ void WlClipboard::add(Format format, const std::string &data)
     return;
   }
 
+  // We just wrote this data to the clipboard; keep the cache in sync so
+  // subsequent reads don't need to spawn wl-paste.
   std::scoped_lock<std::mutex> lock(m_cacheMutex);
   updateOwnership(true);
-  invalidateCache();
+  m_cachedData[static_cast<int>(format)] = data;
+  m_cachedAvailable[static_cast<int>(format)] = !data.empty();
+  m_cached = true;
+  m_cachedTime = getCurrentTime();
 }
 
 bool WlClipboard::runWlCopy(const QStringList &args) const
@@ -179,8 +331,10 @@ void WlClipboard::close() const
 
   LOG_DEBUG("close clipboard");
 
+  // Note: the cache is deliberately NOT invalidated here. It is kept until
+  // the background sync worker refreshes it or a local write invalidates
+  // it, so the server can read the clipboard without spawning wl-paste.
   m_open = false;
-  const_cast<WlClipboard *>(this)->invalidateCache();
 }
 
 IClipboard::Time WlClipboard::getTime() const
@@ -202,30 +356,18 @@ bool WlClipboard::has(Format format) const
     return m_cachedAvailable[static_cast<int>(format)];
   }
 
-  if (const auto availableTypes = getAvailableMimeTypes(); availableTypes.isEmpty()) {
+  // Cache expired: fall back to reading the type list. This spawns
+  // wl-paste, so it should be rare (the sync worker refreshes the cache
+  // on every screen leave).
+  const auto availableTypes = getAvailableMimeTypes();
+  if (availableTypes.isEmpty()) {
     // No types available - mark all formats as unavailable
     for (int i = 0; i < static_cast<int>(Format::TotalFormats); ++i) {
       m_cachedAvailable[i] = false;
       m_cachedData[i].clear();
     }
   } else {
-    using enum IClipboard::Format;
-    // Check each format against available types
-    for (int i = 0; i < static_cast<int>(TotalFormats); ++i) {
-      auto currentFormat = static_cast<Format>(i);
-      const auto mimeType = formatToMimeType(currentFormat);
-
-      m_cachedAvailable[i] = false;
-      if (!mimeType.isEmpty()) {
-        for (const auto &available : availableTypes) {
-          if (available == mimeType || (currentFormat == Text && available == QStringLiteral("text/plain")) ||
-              (currentFormat == HTML && available.startsWith(QStringLiteral("text/html")))) {
-            m_cachedAvailable[i] = true;
-            break;
-          }
-        }
-      }
-    }
+    applyTypes(availableTypes);
   }
 
   m_cached = true;
@@ -322,27 +464,24 @@ QStringList WlClipboard::getAvailableMimeTypes() const
   return QString::fromLocal8Bit(cmd.readAll()).split(newLine);
 }
 
-void WlClipboard::updateTypes(bool reportChange)
+void WlClipboard::applyTypes(const QStringList &types) const
 {
-  // Note: this spawns "wl-paste --list-types" which, on compositors without
-  // ext-data-control (e.g. GNOME/mutter), briefly maps a popup surface and
-  // therefore steals focus. That is why change detection is on demand
-  // (pointer leaving the screen), not timer-based.
-  const auto currentTypes = getAvailableMimeTypes();
+  using enum IClipboard::Format;
+  for (int i = 0; i < static_cast<int>(TotalFormats); ++i) {
+    auto currentFormat = static_cast<Format>(i);
+    const auto mimeType = formatToMimeType(currentFormat);
 
-  if (currentTypes == m_lastTypes) {
-    return;
-  }
-
-  m_lastTypes = currentTypes;
-
-  if (reportChange) {
-    m_hasChanged = true;
-
-    // Clear cache when clipboard changes
-    std::scoped_lock<std::mutex> lock(m_cacheMutex);
-    invalidateCache();
-    updateOwnership(false);
+    m_cachedAvailable[i] = false;
+    if (!mimeType.isEmpty()) {
+      for (const auto &available : types) {
+        if (available == mimeType ||
+            (currentFormat == Text && available == QStringLiteral("text/plain")) ||
+            (currentFormat == HTML && available.startsWith(QStringLiteral("text/html")))) {
+          m_cachedAvailable[i] = true;
+          break;
+        }
+      }
+    }
   }
 }
 
@@ -354,15 +493,6 @@ IClipboard::Time WlClipboard::getCurrentTime() const
 bool WlClipboard::isOwned() const
 {
   return m_owned;
-}
-
-void WlClipboard::resetChanged()
-{
-  m_hasChanged = false;
-
-  // Clear cache when resetting change flag to force fresh data retrieval
-  std::scoped_lock<std::mutex> lock(m_cacheMutex);
-  invalidateCache();
 }
 
 void WlClipboard::updateOwnership(bool owned)

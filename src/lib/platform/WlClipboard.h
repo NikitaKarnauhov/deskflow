@@ -9,7 +9,6 @@
 #include "deskflow/ClipboardTypes.h"
 #include "deskflow/IClipboard.h"
 
-#include <atomic>
 #include <fcntl.h>
 #include <memory>
 #include <mutex>
@@ -23,6 +22,13 @@
 /*!
 This class implements clipboard functionality for Wayland environments
 by using the wl-clipboard utilities (wl-copy and wl-paste).
+
+Reads (get/has) are served from a cache that is refreshed by a
+background sync worker (see WlClipboardCollection) whenever the pointer
+leaves the screen. On compositors without ext-data-control
+(e.g. GNOME/mutter) every wl-paste/wl-copy invocation briefly maps a
+popup surface and steals focus, so reads must not happen on a timer or
+in the screen-switch critical path.
 */
 class WlClipboard : public QObject, public IClipboard
 {
@@ -42,15 +48,21 @@ public:
   //! Check if wl-clipboard tools are available
   static bool isAvailable();
 
-  //! Poll the current MIME type list once and report whether it changed
-  //! since the last check. Called when the pointer leaves the screen.
-  bool refreshTypes();
+  // The following methods use plain POSIX process APIs (no Qt event
+  // loop) and may be called from the background sync worker thread.
 
-  //! Check if clipboard has changed
-  bool hasChanged() const;
+  //! Compare the current MIME type list with the last seen one, update
+  //! the cache and report whether the clipboard changed
+  bool checkChangePosix();
 
-  //! Reset the changed flag and clear cache
-  void resetChanged();
+  //! Read a format from the clipboard into \p data
+  bool readPosix(Format format, std::string &data);
+
+  //! Store freshly read data in the cache
+  void storeData(Format format, const std::string &data);
+
+  //! Get the currently cached data for a format (empty if none)
+  std::string getCachedData(Format format) const;
 
   // IClipboard overrides
   bool empty() override;
@@ -68,12 +80,12 @@ private:
   //! Convert MIME type to IClipboard format
   Format mimeTypeToFormat(const QString &mimeType) const;
 
-  //! Get available MIME types from clipboard
+  //! Get available MIME types from clipboard (spawns wl-paste; call from
+  //! the server thread only)
   QStringList getAvailableMimeTypes() const;
 
-  //! Compare the current MIME type list with the last seen one and update
-  //! the change flag (unless reportChange is false, for initial seeding)
-  void updateTypes(bool reportChange);
+  //! Update the format availability cache from a MIME type list
+  void applyTypes(const QStringList &types) const;
 
   //! Get current clipboard serial/timestamp
   Time getCurrentTime() const;
@@ -97,16 +109,20 @@ private:
   mutable Time m_time = 0;
   mutable Time m_cachedTime = 0;
   mutable bool m_owned = false;
-  mutable std::atomic<bool> m_hasChanged = false;
 
-  // Cached clipboard data
+  // Clipboard data and type cache. The cache is long-lived: it is only
+  // refreshed by the background sync worker (checkChangePosix/storeData)
+  // or invalidated by local writes, never by open/close, so that the
+  // server can read the clipboard without spawning wl-paste.
   mutable std::mutex m_cacheMutex;
   mutable bool m_cached = false;
   mutable std::string m_cachedData[static_cast<int>(Format::TotalFormats)];
   mutable bool m_cachedAvailable[static_cast<int>(Format::TotalFormats)];
 
-  // Last seen MIME type list, used for on-demand change detection
-  mutable QStringList m_lastTypes;
+  // Last seen MIME type list, used for change detection. Touched by the
+  // constructor (server thread, before the worker starts) and by the
+  // background worker afterwards.
+  QStringList m_lastTypes;
 
   // Clipboard selection type (true = clipboard, false = primary)
   bool m_useClipboard;

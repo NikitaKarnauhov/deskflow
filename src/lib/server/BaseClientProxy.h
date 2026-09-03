@@ -64,6 +64,11 @@ public:
   bool leave() override = 0;
   void setClipboard(ClipboardID, const IClipboard *) override = 0;
   void grabClipboard(ClipboardID) override = 0;
+  //! Whether this screen's clipboard sync happens in the background
+  virtual bool clipboardSyncIsAsync() const
+  {
+    return false;
+  }
   void setClipboardDirty(ClipboardID, bool) override = 0;
   void keyDown(KeyID, KeyModifierMask, KeyButton, const std::string &) override = 0;
   void keyRepeat(KeyID, KeyModifierMask, int32_t count, KeyButton, const std::string &lang) override = 0;

@@ -448,7 +448,13 @@ void Server::switchScreen(BaseClientProxy *dst, int32_t x, int32_t y, bool forSc
 
     // update the primary client's clipboards if we're leaving the
     // primary screen.
-    if (m_active == m_primaryClient && m_enableClipboard) {
+    //
+    // Skip this when the primary screen manages its clipboard sync in the
+    // background (wl-clipboard on Wayland): re-fetching here would block
+    // the screen switch on wl-paste invocations. The screen's background
+    // worker announces changes instead, and the data it read is served
+    // from its cache.
+    if (m_active == m_primaryClient && m_enableClipboard && !m_primaryClient->clipboardSyncIsAsync()) {
       for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
         const ClipboardInfo &clipboard = m_clipboards[id];
         if (clipboard.m_clipboardOwner == getName(m_primaryClient)) {

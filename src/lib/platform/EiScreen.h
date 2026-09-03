@@ -74,6 +74,7 @@ public:
   void leave() override;
   bool setClipboard(ClipboardID, const IClipboard *) override;
   void checkClipboards() override;
+  bool clipboardSyncIsAsync() const override;
   void openScreensaver(bool notify) override;
   void closeScreensaver() override;
   void screensaver(bool activate) override;
@@ -129,6 +130,13 @@ private:
   void stopEmulating() const;
   void cancelIdleEmulationTimer() const;
 
+  //! Create the one-shot timer that polls for the background clipboard
+  //! sync result (no-op while one is already running)
+  void ensureClipboardSyncTimer();
+
+  //! Handle a clipboard sync timer tick: deliver the worker's result
+  void handleClipboardSyncTick();
+
   static void handleEiLogEvent(ei *ei, const ei_log_priority priority, const char *message, ei_log_context *)
   {
     auto screen = static_cast<EiScreen *>(ei_get_user_data(ei));
@@ -169,6 +177,7 @@ private:
   // this screen even while the deskflow cursor logically sits on it.
   mutable bool m_isEmulating = false;
   mutable EventQueueTimer *m_idleEmulationTimer = nullptr;
+  mutable EventQueueTimer *m_clipboardSyncTimer = nullptr;
   // Chosen empirically on one machine in 2026-06; not derived from any protocol constant.
   static constexpr double s_idleEmulationTimeout = 4.0;
 

@@ -85,6 +85,15 @@ public:
   */
   virtual void checkClipboards() = 0;
 
+  //! Whether clipboard change detection/sync happens in the background
+  //! (asynchronously). When true, the server must not re-fetch the
+  //! screen's clipboard synchronously on screen switches; the screen
+  //! itself will announce changes.
+  virtual bool clipboardSyncIsAsync() const
+  {
+    return false;
+  }
+
   //! Open screen saver
   /*!
   Open the screen saver.  If \c notify is true then this object must

@@ -50,6 +50,7 @@ EiScreen::EiScreen(bool isPrimary, IEventQueue *events, bool usePortal)
   initEi();
   m_keyState = new EiKeyState(this, events);
   m_wlClipboard = new WlClipboardCollection();
+  m_wlClipboard->setOnScreenQuery([this] { return m_isOnScreen; });
   // install event handlers
   m_events->addHandler(EventTypes::System, m_events->getSystemTarget(), [this](const auto &e) {
     handleSystemEvent(e);
@@ -92,6 +93,12 @@ EiScreen::~EiScreen()
   m_events->removeHandler(EventTypes::System, m_events->getSystemTarget());
 
   cancelIdleEmulationTimer();
+
+  if (m_clipboardSyncTimer) {
+    m_events->removeHandler(EventTypes::Timer, m_clipboardSyncTimer);
+    m_events->deleteTimer(m_clipboardSyncTimer);
+    m_clipboardSyncTimer = nullptr;
+  }
 
   cleanupEi();
 
@@ -521,38 +528,79 @@ bool EiScreen::setClipboard(ClipboardID id, const IClipboard *clipboard)
   return ok;
 }
 
+bool EiScreen::clipboardSyncIsAsync() const
+{
+  return m_wlClipboard != nullptr && m_wlClipboard->isAvailable();
+}
+
 void EiScreen::checkClipboards()
 {
   // Called when the pointer leaves this screen. With the wl-clipboard
-  // backend, detect local clipboard changes by comparing the current MIME
-  // type list with the last seen one. This is on demand rather than
-  // timer-based because on compositors without ext-data-control
-  // (e.g. GNOME/mutter) each wl-paste invocation briefly maps a popup
-  // surface and steals focus.
-  if (m_wlClipboard && m_wlClipboard->isAvailable() && m_wlClipboard->refreshTypes()) {
-    if (m_isPrimary) {
-      // The primary screen first grabs (retakes) ownership of each
-      // clipboard, then announces the change so the server fetches the
-      // data and pushes it to the clients.
-      for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
-        sendClipboardEvent(EventTypes::ClipboardGrabbed, id);
-      }
-      for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
-        sendClipboardEvent(EventTypes::ClipboardChanged, id);
-      }
-    } else {
-      // A secondary screen announces ClipboardGrabbed; the client
-      // handles it and sends the data to the server (on leave).
-      for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
-        sendClipboardEvent(EventTypes::ClipboardGrabbed, id);
-      }
+  // backend, request a background sync: a worker thread compares the
+  // current MIME type lists with the last seen ones (spawning wl-paste,
+  // which briefly steals focus on GNOME/mutter) and reads any changed
+  // content. The result is delivered via a timer, so none of this blocks
+  // the screen switch.
+  if (m_wlClipboard && m_wlClipboard->isAvailable()) {
+    m_wlClipboard->requestLeaveSync();
+    ensureClipboardSyncTimer();
+  }
+}
+
+void EiScreen::ensureClipboardSyncTimer()
+{
+  if (m_clipboardSyncTimer) {
+    return;
+  }
+
+  m_clipboardSyncTimer = m_events->newOneShotTimer(0.2, nullptr);
+  m_events->addHandler(EventTypes::Timer, m_clipboardSyncTimer, [this](const auto &) {
+    m_events->removeHandler(EventTypes::Timer, m_clipboardSyncTimer);
+    m_events->deleteTimer(m_clipboardSyncTimer);
+    m_clipboardSyncTimer = nullptr;
+    handleClipboardSyncTick();
+  });
+}
+
+void EiScreen::handleClipboardSyncTick()
+{
+  if (!m_wlClipboard || !m_wlClipboard->isAvailable()) {
+    return;
+  }
+
+  WlClipboardCollection::SyncResult result;
+  if (!m_wlClipboard->takeSyncResult(result)) {
+    // The worker's result isn't ready yet. Keep polling while a sync is
+    // in flight; otherwise stop (the next screen leave re-arms the
+    // timer).
+    if (m_wlClipboard->hasWork()) {
+      ensureClipboardSyncTimer();
     }
     return;
   }
 
-  // For portal-based input capture, clipboard changes come via portal events
-  // For socket-based, clipboard is passive and changes are sent explicitly
-  // Nothing to do here
+  if (m_isPrimary) {
+    // The primary screen first grabs (retakes) ownership of each changed
+    // clipboard, then announces the change so the server fetches the data
+    // (a cache hit, since the worker already read it) and pushes it to
+    // the clients.
+    for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
+      if (!result.changed[id]) {
+        continue;
+      }
+      sendClipboardEvent(EventTypes::ClipboardGrabbed, id);
+      sendClipboardEvent(EventTypes::ClipboardChanged, id);
+    }
+  } else {
+    // A secondary screen announces ClipboardGrabbed for each changed
+    // clipboard; the client handles it and sends the data to the server
+    // (on leave).
+    for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
+      if (result.changed[id]) {
+        sendClipboardEvent(EventTypes::ClipboardGrabbed, id);
+      }
+    }
+  }
 }
 
 void EiScreen::openScreensaver(bool notify)

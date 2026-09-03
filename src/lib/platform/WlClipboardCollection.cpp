@@ -9,11 +9,24 @@
 #include "base/Log.h"
 #include "deskflow/ClipboardTypes.h"
 
+#include <chrono>
+
 namespace deskflow {
+
+namespace {
+// How long after the last leave request the sync waits before running.
+// Jitter at the screen edge produces a stream of requests; the window is
+// extended by each new request, so a burst of switches results in a
+// single sync.
+const int kDebounceMs = 200;
+} // namespace
 
 WlClipboardCollection::WlClipboardCollection()
 {
   initialize();
+  if (m_available) {
+    m_worker = std::thread([this] { workerLoop(); });
+  }
 }
 
 WlClipboardCollection::~WlClipboardCollection()
@@ -35,45 +48,125 @@ IClipboard *WlClipboardCollection::getClipboard(ClipboardID id) const
   return m_clipboards[id].get();
 }
 
-bool WlClipboardCollection::hasChanged() const
+void WlClipboardCollection::setOnScreenQuery(std::function<bool()> query)
 {
-  if (!m_available) {
-    return false;
-  }
-
-  for (const auto &clipboard : m_clipboards) {
-    if (clipboard && clipboard->hasChanged()) {
-      return true;
-    }
-  }
-
-  return false;
+  std::scoped_lock<std::mutex> lock(m_mutex);
+  m_onScreenQuery = std::move(query);
 }
 
-bool WlClipboardCollection::refreshTypes()
-{
-  if (!m_available) {
-    return false;
-  }
-
-  bool changed = false;
-  for (const auto &clipboard : m_clipboards) {
-    if (clipboard && clipboard->refreshTypes()) {
-      changed = true;
-    }
-  }
-  return changed;
-}
-
-void WlClipboardCollection::resetChanged() const
+void WlClipboardCollection::requestLeaveSync()
 {
   if (!m_available) {
     return;
   }
+  {
+    std::scoped_lock<std::mutex> lock(m_mutex);
+    m_syncRequested = true;
+  }
+  m_cv.notify_all();
+}
 
-  for (const auto &clipboard : m_clipboards) {
-    if (clipboard) {
-      clipboard->resetChanged();
+bool WlClipboardCollection::hasWork() const
+{
+  std::scoped_lock<std::mutex> lock(m_mutex);
+  return m_syncActive || m_syncDone;
+}
+
+bool WlClipboardCollection::takeSyncResult(SyncResult &out)
+{
+  std::scoped_lock<std::mutex> lock(m_mutex);
+  if (!m_syncDone) {
+    return false;
+  }
+  m_syncDone = false;
+  m_syncActive = false;
+  // The result is now delivered; any previously undelivered change is
+  // superseded by (or re-sent through) it.
+  m_undelivered = false;
+  out = m_result;
+  return true;
+}
+
+void WlClipboardCollection::workerLoop()
+{
+  for (;;) {
+    std::unique_lock<std::mutex> lock(m_mutex);
+    m_cv.wait(lock, [this] { return m_stop || m_syncRequested; });
+    if (m_stop) {
+      break;
+    }
+    m_syncRequested = false;
+    m_syncActive = true;
+
+    // Debounce: wait until the pointer is off the screen and a quiet
+    // period has passed since the last request. New requests arriving in
+    // the meantime extend the quiet period (coalescing jitter at the
+    // screen edge into a single sync).
+    bool cancelled = false;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kDebounceMs);
+    for (;;) {
+      const bool offScreen = !m_onScreenQuery || !m_onScreenQuery();
+      if (offScreen && std::chrono::steady_clock::now() >= deadline) {
+        break;
+      }
+      if (m_cv.wait_for(lock, std::chrono::milliseconds(50),
+                        [this] { return m_stop || m_syncRequested; })) {
+        if (m_stop) {
+          cancelled = true;
+        } else {
+          m_syncRequested = false;
+          deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kDebounceMs);
+        }
+      }
+    }
+
+    if (cancelled) {
+      m_syncActive = false;
+      break;
+    }
+
+    lock.unlock();
+
+    // Run the checks. These spawn wl-paste and take a few hundred
+    // milliseconds, hence the background thread.
+    //
+    // A clipboard "changed" if either its set of MIME types changed or
+    // its text content changed (copying different text keeps the same
+    // types, so the content must be compared too). A previously
+    // undelivered change forces a re-report: the type/content state was
+    // already advanced by that check, so without it the change would be
+    // lost if the pointer returned to the screen before the result was
+    // consumed.
+    SyncResult result;
+    for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
+      if (!m_clipboards[id]) {
+        continue;
+      }
+
+      const bool typesChanged = m_clipboards[id]->checkChangePosix();
+
+      std::string text;
+      bool textChanged = false;
+      if (m_clipboards[id]->readPosix(IClipboard::Format::Text, text)) {
+        textChanged = (text != m_clipboards[id]->getCachedData(IClipboard::Format::Text));
+        // Store the fresh text so the server's subsequent read is a cache
+        // hit. Other formats are read lazily on demand.
+        m_clipboards[id]->storeData(IClipboard::Format::Text, text);
+      }
+
+      result.changed[id] = typesChanged || textChanged || m_undelivered;
+    }
+
+    bool anyChanged = false;
+    for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
+      anyChanged = anyChanged || result.changed[id];
+    }
+
+    lock.lock();
+    m_result = result;
+    m_syncDone = true;
+    if (anyChanged) {
+      m_undelivered = true;
     }
   }
 }
@@ -107,6 +200,17 @@ void WlClipboardCollection::initialize()
 
 void WlClipboardCollection::cleanup()
 {
+  {
+    std::scoped_lock<std::mutex> lock(m_mutex);
+    m_stop = true;
+    m_syncRequested = false;
+  }
+  m_cv.notify_all();
+
+  if (m_worker.joinable()) {
+    m_worker.join();
+  }
+
   m_clipboards.clear();
   m_available = false;
 }

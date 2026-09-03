@@ -113,6 +113,7 @@ public:
   bool leave() override;
   void setClipboard(ClipboardID, const IClipboard *) override;
   void grabClipboard(ClipboardID) override;
+  bool clipboardSyncIsAsync() const override;
   void setClipboardDirty(ClipboardID, bool) override;
   void keyDown(KeyID, KeyModifierMask, KeyButton, const std::string &) override;
   void keyRepeat(KeyID, KeyModifierMask, int32_t count, KeyButton, const std::string &) override;
