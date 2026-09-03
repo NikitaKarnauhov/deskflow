@@ -148,6 +148,10 @@ private:
   // clipboard stuff
   EiClipboard *m_clipboard = nullptr;
   WlClipboardCollection *m_wlClipboard = nullptr;
+  // Last marshalled content written to each wl-backed clipboard, used to
+  // skip redundant writes (the server pushes the clipboard on every
+  // screen enter and each wl-copy invocation steals focus briefly).
+  std::string m_lastWrittenClipboard[kClipboardEnd];
   size_t m_maximumClipboardSize = INT_MAX;
 
   std::vector<ei_device *> m_eiDevices;

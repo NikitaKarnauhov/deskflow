@@ -455,7 +455,18 @@ bool EiScreen::setClipboard(ClipboardID id, const IClipboard *clipboard)
   if (m_wlClipboard && m_wlClipboard->isAvailable()) {
     if (auto targetClipboard = m_wlClipboard->getClipboard(id); targetClipboard) {
       if (clipboard) {
-        return IClipboard::copy(targetClipboard, clipboard);
+        // The server pushes the clipboard to the active screen on every
+        // enter; skip the write (each wl-copy invocation briefly steals
+        // focus on GNOME) when the content hasn't changed.
+        const std::string data = IClipboard::marshall(clipboard);
+        if (data == m_lastWrittenClipboard[id]) {
+          return true;
+        }
+        const bool ok = IClipboard::copy(targetClipboard, clipboard);
+        if (ok) {
+          m_lastWrittenClipboard[id] = data;
+        }
+        return ok;
       }
       // A null clipboard means asserting ownership (grab): claim the
       // clipboard with empty content.

@@ -40,6 +40,7 @@ const char *const s_mimeTypeHtmlWindows = "HTML Format";
 
 // Command timeout (milliseconds)
 const int kCacheValidityMs = 100;
+const int kProcessTimeoutMs = 2000;
 } // namespace
 
 WlClipboard::WlClipboard(ClipboardID id) : m_id(id), m_useClipboard(id == kClipboardClipboard)
@@ -54,14 +55,7 @@ WlClipboard::WlClipboard(ClipboardID id) : m_id(id), m_useClipboard(id == kClipb
   updateTypes(false);
 }
 
-WlClipboard::~WlClipboard()
-{
-  for (auto &cmd : m_runningWlCopies) {
-    cmd->close();
-    cmd->waitForFinished(100);
-  }
-  m_runningWlCopies.clear();
-}
+WlClipboard::~WlClipboard() = default;
 
 ClipboardID WlClipboard::getID() const
 {
@@ -89,27 +83,19 @@ bool WlClipboard::empty()
   if (!m_open) {
     return false;
   }
-  auto cmd = new QProcess(this);
-  cmd->setProgram(s_copyApp);
-  m_runningWlCopies.append(cmd);
-  connect(cmd, &QProcess::finished, this, [this, cmd] { m_runningWlCopies.removeAll(cmd); });
 
   QStringList args = {s_noNewLine, ""};
   if (!m_useClipboard)
     args.prepend(s_isPrimary);
 
-  cmd->setArguments(args);
-  cmd->start();
-  bool success = cmd->waitForStarted(100);
-
-  if (success) {
-    // Update ownership and cache only if command succeeded
-    std::scoped_lock<std::mutex> lock(m_cacheMutex);
-    updateOwnership(true);
-    invalidateCache();
+  if (!runWlCopy(args)) {
+    return false;
   }
 
-  return success;
+  std::scoped_lock<std::mutex> lock(m_cacheMutex);
+  updateOwnership(true);
+  invalidateCache();
+  return true;
 }
 
 void WlClipboard::add(Format format, const std::string &data)
@@ -128,24 +114,48 @@ void WlClipboard::add(Format format, const std::string &data)
     return;
   }
 
-  auto cmd = new QProcess(this);
-  cmd->setProgram(s_copyApp);
-
-  m_runningWlCopies.append(cmd);
-  connect(cmd, &QProcess::finished, this, [this, cmd] { m_runningWlCopies.removeAll(cmd); });
-
   QStringList args = {s_noNewLine, s_readType.arg(mimeType), QString::fromStdString(data)};
   if (!m_useClipboard)
     args.prepend(s_isPrimary);
 
-  cmd->setArguments(args);
-  cmd->start();
-
-  if (cmd->waitForStarted(100)) {
-    std::scoped_lock<std::mutex> lock(m_cacheMutex);
-    updateOwnership(true);
-    invalidateCache();
+  if (!runWlCopy(args)) {
+    return;
   }
+
+  std::scoped_lock<std::mutex> lock(m_cacheMutex);
+  updateOwnership(true);
+  invalidateCache();
+}
+
+bool WlClipboard::runWlCopy(const QStringList &args) const
+{
+  // wl-copy must run synchronously: IClipboard::copy() performs a sequence
+  // of writes (empty, then one per format) and the Wayland clipboard ends
+  // up with whatever finished last. Async launches would race and could
+  // leave the clipboard emptied or with stale content.
+  QProcess cmd;
+  cmd.setProgram(s_copyApp);
+  cmd.setArguments(args);
+  cmd.start();
+
+  if (!cmd.waitForStarted(kProcessTimeoutMs)) {
+    LOG_WARN("failed to start %s", s_copyApp.toStdString().c_str());
+    return false;
+  }
+  if (!cmd.waitForFinished(kProcessTimeoutMs)) {
+    cmd.kill();
+    cmd.waitForFinished(500);
+    LOG_WARN("%s timed out", s_copyApp.toStdString().c_str());
+    return false;
+  }
+  if (cmd.exitStatus() != QProcess::NormalExit || cmd.exitCode() != 0) {
+    LOG_WARN(
+        "%s failed: %s", s_copyApp.toStdString().c_str(),
+        cmd.readAllStandardError().toStdString().c_str()
+    );
+    return false;
+  }
+  return true;
 }
 
 bool WlClipboard::open(Time time) const

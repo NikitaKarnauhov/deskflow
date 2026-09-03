@@ -17,8 +17,8 @@
 
 #include <QObject>
 #include <QString>
+#include <QStringList>
 
-class QProcess;
 //! Wayland clipboard implementation using wl-copy/wl-paste
 /*!
 This class implements clipboard functionality for Wayland environments
@@ -87,6 +87,10 @@ private:
   //! Invalidate cached clipboard data
   void invalidateCache();
 
+  //! Run wl-copy with the given arguments, waiting for it to finish.
+  //! Writes must be synchronous so a sequence of them applies in order.
+  bool runWlCopy(const QStringList &args) const;
+
 private:
   ClipboardID m_id;
   mutable bool m_open = false;
@@ -106,7 +110,4 @@ private:
 
   // Clipboard selection type (true = clipboard, false = primary)
   bool m_useClipboard;
-
-  // Hold a ref to running wl-copy processes
-  QList<QProcess *> m_runningWlCopies;
 };
