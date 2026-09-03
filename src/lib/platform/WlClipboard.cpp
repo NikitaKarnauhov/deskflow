@@ -223,7 +223,7 @@ WlClipboard::PosixCheckResult WlClipboard::checkChangePosix()
   const std::string &pastePath = wlPastePath();
   if (pastePath.empty()) {
     LOG_WARN("wl-paste not found in PATH");
-    return false;
+    return PosixCheckResult::Failed;
   }
 
   std::string raw;
