@@ -579,6 +579,11 @@ void EiScreen::handleClipboardSyncTick()
     return;
   }
 
+  // DIAGNOSTIC
+  LOG_INFO(
+      "diag: wl-clipboard sync delivered (%s): clip0=%d clip1=%d",
+      m_isPrimary ? "primary" : "secondary", (int)result.changed[0], (int)result.changed[1]);
+
   if (m_isPrimary) {
     // The primary screen first grabs (retakes) ownership of each changed
     // clipboard, then announces the change so the server fetches the data

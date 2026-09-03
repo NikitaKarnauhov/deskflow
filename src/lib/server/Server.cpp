@@ -455,6 +455,9 @@ void Server::switchScreen(BaseClientProxy *dst, int32_t x, int32_t y, bool forSc
     // worker announces changes instead, and the data it read is served
     // from its cache.
     if (m_active == m_primaryClient && m_enableClipboard && !m_primaryClient->clipboardSyncIsAsync()) {
+      // DIAGNOSTIC: this path should never run on Wayland with the
+      // wl-clipboard backend; it would re-fetch synchronously on leave.
+      LOG_INFO("diag: sync clipboard re-fetch on leave (synchronous path)");
       for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
         const ClipboardInfo &clipboard = m_clipboards[id];
         if (clipboard.m_clipboardOwner == getName(m_primaryClient)) {
@@ -1200,7 +1203,8 @@ void Server::handleClipboardGrabbed(const Event &event, BaseClientProxy *grabber
   }
 
   if (grabber == m_primaryClient && m_active != m_primaryClient) {
-    LOG_DEBUG("clipboard grabbed while active screen was changed, resending clipboard data");
+    // DIAGNOSTIC
+    LOG_INFO("diag: primary grab while active screen differs, resending clipboard %d", info->m_id);
     onClipboardChanged(m_primaryClient, info->m_id, clipboard.m_clipboardSeqNum);
   }
 }
@@ -1212,6 +1216,8 @@ void Server::handleClipboardChanged(const Event &event, BaseClientProxy *client)
     return;
   }
   const auto *info = static_cast<const IScreen::ClipboardInfo *>(event.getData());
+  // DIAGNOSTIC
+  LOG_INFO("diag: clipboard %d changed from %s", info->m_id, client->getName().c_str());
   onClipboardChanged(client, info->m_id, info->m_sequenceNumber);
 }
 

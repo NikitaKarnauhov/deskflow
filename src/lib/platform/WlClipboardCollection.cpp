@@ -157,12 +157,20 @@ void WlClipboardCollection::workerLoop()
 
       std::string text;
       bool textChanged = false;
+      bool textRead = false;
       if (m_clipboards[id]->readPosix(IClipboard::Format::Text, text)) {
+        textRead = true;
         textChanged = (text != m_clipboards[id]->getCachedData(IClipboard::Format::Text));
         // Store the fresh text so the server's subsequent read is a cache
         // hit. Other formats are read lazily on demand.
         m_clipboards[id]->storeData(IClipboard::Format::Text, text);
       }
+
+      // DIAGNOSTIC
+      LOG_INFO(
+          "diag: wl-clipboard check [%d]: types %s, text %s (%zu bytes)",
+          id, typesChanged ? "CHANGED" : "same",
+          textRead ? (textChanged ? "CHANGED" : "same") : "READ FAILED", text.size());
 
       result.changed[id] = typesChanged || textChanged || m_undelivered;
     }
