@@ -10,6 +10,7 @@
 #include "deskflow/ClipboardTypes.h"
 
 #include <chrono>
+#include <thread>
 
 namespace deskflow {
 
@@ -157,9 +158,14 @@ void WlClipboardCollection::workerLoop()
 
       std::string text;
       bool textChanged = false;
-      bool textRead = false;
-      if (m_clipboards[id]->readPosix(IClipboard::Format::Text, text)) {
-        textRead = true;
+      bool textRead = m_clipboards[id]->readPosix(IClipboard::Format::Text, text);
+      if (!textRead) {
+        // Transient failure (wl-paste sometimes needs a moment to map its
+        // popup): retry once after a short pause.
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        textRead = m_clipboards[id]->readPosix(IClipboard::Format::Text, text);
+      }
+      if (textRead) {
         textChanged = (text != m_clipboards[id]->getCachedData(IClipboard::Format::Text));
         // Store the fresh text so the server's subsequent read is a cache
         // hit. Other formats are read lazily on demand.

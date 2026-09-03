@@ -1202,7 +1202,13 @@ void Server::handleClipboardGrabbed(const Event &event, BaseClientProxy *grabber
     }
   }
 
-  if (grabber == m_primaryClient && m_active != m_primaryClient) {
+  // Resend the primary's data to the active screen. Skip it when the
+  // primary screen manages its clipboard sync in the background
+  // (wl-clipboard on Wayland): at this instant we can only serve the
+  // worker's cached (possibly stale) content, and the worker's own
+  // change detection will deliver the fresh data shortly after the
+  // screen switch.
+  if (grabber == m_primaryClient && m_active != m_primaryClient && !m_primaryClient->clipboardSyncIsAsync()) {
     // DIAGNOSTIC
     LOG_INFO("diag: primary grab while active screen differs, resending clipboard %d", info->m_id);
     onClipboardChanged(m_primaryClient, info->m_id, clipboard.m_clipboardSeqNum);

@@ -11,6 +11,8 @@
 #include <cerrno>
 #include <chrono>
 #include <csignal>
+#include <cstdlib>
+#include <cstring>
 #include <fcntl.h>
 #include <poll.h>
 #include <spawn.h>
@@ -48,6 +50,47 @@ const char *const s_mimeTypeHtmlWindows = "HTML Format";
 const int kCacheValidityMs = 10 * 60 * 1000;
 const int kProcessTimeoutMs = 2000;
 
+// posix_spawn(3) takes a path to the executable: unlike execvp(3) it
+// does NOT search $PATH. The sync worker spawns wl-paste/wl-copy from a
+// non-Qt thread, so resolve the tools to absolute paths once.
+std::string resolveToolPath(const char *name)
+{
+  const char *pathVar = ::getenv("PATH");
+  if (pathVar == nullptr) {
+    return {};
+  }
+  std::string searchPath(pathVar);
+  size_t begin = 0;
+  for (;;) {
+    const size_t end = searchPath.find(':', begin);
+    const size_t len = (end == std::string::npos) ? std::string::npos : end - begin;
+    const std::string dir = searchPath.substr(begin, len);
+    if (!dir.empty()) {
+      const std::string candidate = dir + '/' + name;
+      if (::access(candidate.c_str(), X_OK) == 0) {
+        return candidate;
+      }
+    }
+    if (end == std::string::npos) {
+      break;
+    }
+    begin = end + 1;
+  }
+  return {};
+}
+
+const std::string &wlPastePath()
+{
+  static const std::string path = resolveToolPath("wl-paste");
+  return path;
+}
+
+const std::string &wlCopyPath()
+{
+  static const std::string path = resolveToolPath("wl-copy");
+  return path;
+}
+
 // Run a command to completion and capture its standard output.
 //
 // Uses only POSIX APIs (no Qt), so it is safe to call from any thread,
@@ -80,7 +123,10 @@ bool runToolCapture(const std::vector<std::string> &argv, int timeoutMs, std::st
 
   pid_t pid = -1;
   bool ok = false;
-  if (posix_spawn(&pid, argv[0].c_str(), &actions, nullptr, args.data(), environ) == 0) {
+  const int spawnError = posix_spawn(&pid, argv[0].c_str(), &actions, nullptr, args.data(), environ);
+  if (spawnError != 0) {
+    LOG_WARN("posix_spawn(%s) failed: %s", argv[0].c_str(), strerror(spawnError));
+  } else {
     close(pipeFds[1]);
     pipeFds[1] = -1;
 
@@ -108,6 +154,7 @@ bool runToolCapture(const std::vector<std::string> &argv, int timeoutMs, std::st
 
       if (std::chrono::steady_clock::now() > deadline) {
         ::kill(pid, SIGKILL);
+        LOG_WARN("clipboard tool timed out: %s", argv[0].c_str());
         break;
       }
     }
@@ -152,13 +199,20 @@ bool WlClipboard::isAvailable()
 
 bool WlClipboard::checkChangePosix()
 {
+  const std::string &pastePath = wlPastePath();
+  if (pastePath.empty()) {
+    LOG_WARN("wl-paste not found in PATH");
+    return false;
+  }
+
   std::string raw;
-  std::vector<std::string> argv = {s_pasteApp.toStdString(), s_listTypes.toStdString()};
+  std::vector<std::string> argv = {pastePath, s_listTypes.toStdString()};
   if (!m_useClipboard) {
     argv.push_back(s_isPrimary.toStdString());
   }
 
   if (!runToolCapture(argv, kProcessTimeoutMs, raw)) {
+    LOG_WARN("failed to read types of clipboard %d via wl-paste", m_id);
     return false;
   }
 
@@ -198,8 +252,14 @@ bool WlClipboard::readPosix(Format format, std::string &data)
     return false;
   }
 
+  const std::string &pastePath = wlPastePath();
+  if (pastePath.empty()) {
+    LOG_WARN("wl-paste not found in PATH");
+    return false;
+  }
+
   std::vector<std::string> argv = {
-      s_pasteApp.toStdString(),
+      pastePath,
       s_noNewLine.toStdString(),
       s_readType.arg(mimeType).toStdString()
   };
@@ -286,7 +346,10 @@ bool WlClipboard::runWlCopy(const QStringList &args) const
   // up with whatever finished last. Async launches would race and could
   // leave the clipboard emptied or with stale content.
   QProcess cmd;
-  cmd.setProgram(s_copyApp);
+  // Prefer the absolute path; QProcess would search PATH for a bare name,
+  // but be explicit for consistency with the posix spawn path.
+  const std::string &copyPath = wlCopyPath();
+  cmd.setProgram(copyPath.empty() ? s_copyApp : QString::fromStdString(copyPath));
   cmd.setArguments(args);
   cmd.start();
 
