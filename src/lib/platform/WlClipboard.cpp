@@ -20,7 +20,11 @@
 #include <unistd.h>
 #include <vector>
 
+#include <QBuffer>
+#include <QDate>
 #include <QDateTime>
+#include <QImage>
+#include <QIODevice>
 #include <QProcess>
 #include <QStandardPaths>
 
@@ -39,6 +43,7 @@ inline static const auto s_readType = QStringLiteral("-t%1");
 inline static const auto s_mimeTypeText = QStringLiteral("text/plain;charset=utf-8");
 inline static const auto s_mimeTypeHtml = QStringLiteral("text/html");
 inline static const auto s_mimeTypeBmp = QStringLiteral("image/bmp");
+inline static const auto s_mimeTypePng = QStringLiteral("image/png");
 
 // Additional HTML MIME type variants
 const char *const s_mimeTypeHtmlUtf8 = "text/html;charset=UTF-8";
@@ -89,6 +94,27 @@ const std::string &wlCopyPath()
 {
   static const std::string path = resolveToolPath("wl-copy");
   return path;
+}
+
+// Convert image data between formats via QImage (the input format is
+// auto-detected from the data). Returns an empty string on failure.
+// QImage/QBuffer need no event loop, so this is safe from any thread.
+std::string convertImageData(const std::string &data, const char *targetFormat)
+{
+  if (data.empty()) {
+    return {};
+  }
+  const QByteArray in(reinterpret_cast<const char *>(data.data()), static_cast<int>(data.size()));
+  QImage image;
+  if (!image.loadFromData(in)) {
+    return {};
+  }
+  QBuffer buffer;
+  buffer.open(QIODevice::WriteOnly);
+  if (!image.save(&buffer, targetFormat)) {
+    return {};
+  }
+  return std::string(buffer.data().constData(), buffer.data().size());
 }
 
 // Run a command to completion and capture its standard output.
@@ -312,11 +338,11 @@ bool WlClipboard::empty()
     return false;
   }
 
-  QStringList args = {s_noNewLine, ""};
+  QStringList args = {s_noNewLine, s_readType.arg(s_mimeTypeText)};
   if (!m_useClipboard)
     args.prepend(s_isPrimary);
 
-  if (!runWlCopy(args)) {
+  if (!runWlCopy(args, "")) {
     return false;
   }
 
@@ -333,20 +359,32 @@ void WlClipboard::add(Format format, const std::string &data)
   }
 
   if (format == Format::HTML) {
+    // wl-copy can only set one MIME type per invocation and the
+    // clipboard already carries the text; HTML is skipped.
     return;
   }
 
-  auto mimeType = formatToMimeType(format);
+  QString mimeType = formatToMimeType(format);
+  std::string payload = data;
+  if (format == Format::Bitmap) {
+    // Wayland apps request image/png. Convert the protocol's BMP to
+    // PNG, falling back to the raw BMP if conversion fails.
+    const std::string png = convertImageData(data, "PNG");
+    if (!png.empty()) {
+      payload = png;
+      mimeType = s_mimeTypePng;
+    }
+  }
   if (mimeType.isEmpty()) {
     LOG_WARN("unsupported clipboard format: %d", format);
     return;
   }
 
-  QStringList args = {s_noNewLine, s_readType.arg(mimeType), QString::fromStdString(data)};
+  QStringList args = {s_noNewLine, s_readType.arg(mimeType)};
   if (!m_useClipboard)
     args.prepend(s_isPrimary);
 
-  if (!runWlCopy(args)) {
+  if (!runWlCopy(args, payload)) {
     return;
   }
 
@@ -356,11 +394,15 @@ void WlClipboard::add(Format format, const std::string &data)
   updateOwnership(true);
   m_cachedData[static_cast<int>(format)] = data;
   m_cachedAvailable[static_cast<int>(format)] = !data.empty();
+  if (format == Format::Bitmap) {
+    m_imageData = payload;
+    m_imageMimeType = mimeType.toStdString();
+  }
   m_cached = true;
   m_cachedTime = getCurrentTime();
 }
 
-bool WlClipboard::runWlCopy(const QStringList &args) const
+bool WlClipboard::runWlCopy(const QStringList &args, const std::string &data) const
 {
   // wl-copy must run synchronously: IClipboard::copy() performs a sequence
   // of writes (empty, then one per format) and the Wayland clipboard ends
@@ -378,6 +420,11 @@ bool WlClipboard::runWlCopy(const QStringList &args) const
     LOG_WARN("failed to start %s", s_copyApp.toStdString().c_str());
     return false;
   }
+  // The data is fed on standard input: it may be binary (images), which
+  // argv transfer would mangle (non-UTF-8) and which could exceed
+  // argument length limits.
+  cmd.write(QByteArray(data.data(), static_cast<int>(data.size())));
+  cmd.closeWriteChannel();
   if (!cmd.waitForFinished(kProcessTimeoutMs)) {
     cmd.kill();
     cmd.waitForFinished(500);
@@ -473,6 +520,24 @@ std::string WlClipboard::get(Format format) const
     return m_cachedData[static_cast<int>(format)];
   }
 
+  if (format == Format::Bitmap) {
+    // No image type offered, or the worker hasn't read it yet: fall back
+    // to converting whatever original image data we have.
+    if (!m_imageData.empty()) {
+      const std::string bmp =
+          (m_imageMimeType == s_mimeTypeBmp.toStdString()) ? m_imageData
+                                                           : convertImageData(m_imageData, "BMP");
+      if (!bmp.empty()) {
+        m_cachedData[static_cast<int>(format)] = bmp;
+        m_cachedAvailable[static_cast<int>(format)] = true;
+        m_cached = true;
+        m_cachedTime = getCurrentTime();
+        return bmp;
+      }
+    }
+    return std::string();
+  }
+
   auto mimeType = formatToMimeType(format);
   if (mimeType.isEmpty()) {
     return std::string();
@@ -560,13 +625,98 @@ void WlClipboard::applyTypes(const QStringList &types) const
       for (const auto &available : types) {
         if (available == mimeType ||
             (currentFormat == Text && available == QStringLiteral("text/plain")) ||
-            (currentFormat == HTML && available.startsWith(QStringLiteral("text/html")))) {
+            (currentFormat == HTML && available.startsWith(QStringLiteral("text/html"))) ||
+            // Wayland apps offer image/png & co., never image/bmp; the
+            // data is converted via QImage, so any image type counts.
+            (currentFormat == Bitmap && available.startsWith(QStringLiteral("image/")))) {
           m_cachedAvailable[i] = true;
           break;
         }
       }
     }
   }
+}
+
+std::string WlClipboard::pickImageMimeType() const
+{
+  std::scoped_lock<std::mutex> lock(m_cacheMutex);
+  for (const QString &preferred : {s_mimeTypePng, s_mimeTypeBmp}) {
+    if (m_lastTypes.contains(preferred)) {
+      return preferred.toStdString();
+    }
+  }
+  for (const QString &type : m_lastTypes) {
+    if (type.startsWith(QStringLiteral("image/"))) {
+      return type.toStdString();
+    }
+  }
+  return {};
+}
+
+WlClipboard::PosixCheckResult WlClipboard::syncImagePosix()
+{
+  const std::string mimeType = pickImageMimeType();
+  if (mimeType.empty()) {
+    // No image type offered: drop any cached image. The types check
+    // already reports the image appearing/disappearing, so nothing else
+    // to do here.
+    {
+      std::scoped_lock<std::mutex> lock(m_cacheMutex);
+      m_imageData.clear();
+      m_imageMimeType.clear();
+    }
+    return PosixCheckResult::Unchanged;
+  }
+
+  const std::string &pastePath = wlPastePath();
+  if (pastePath.empty()) {
+    LOG_WARN("wl-paste not found in PATH");
+    return PosixCheckResult::Failed;
+  }
+
+  std::vector<std::string> argv = {
+      pastePath,
+      s_noNewLine.toStdString(),
+      s_readType.arg(QString::fromStdString(mimeType)).toStdString()
+  };
+  if (!m_useClipboard) {
+    argv.push_back(s_isPrimary.toStdString());
+  }
+
+  std::string data;
+  if (!runToolCapture(argv, kProcessTimeoutMs, data)) {
+    LOG_WARN("failed to read image (%s) of clipboard %d via wl-paste", mimeType.c_str(), m_id);
+    return PosixCheckResult::Failed;
+  }
+
+  bool changed;
+  {
+    std::scoped_lock<std::mutex> lock(m_cacheMutex);
+    changed = (data != m_imageData);
+  }
+  if (changed) {
+    storeImage(mimeType, data);
+  }
+  return changed ? PosixCheckResult::Changed : PosixCheckResult::Unchanged;
+}
+
+void WlClipboard::storeImage(const std::string &mimeType, const std::string &data)
+{
+  // Keep the original data so the image can be written back to the
+  // Wayland clipboard with a type Wayland apps request (image/png), and
+  // convert to BMP for the deskflow protocol.
+  std::string bmp = data;
+  if (mimeType != s_mimeTypeBmp.toStdString()) {
+    bmp = convertImageData(data, "BMP");
+  }
+
+  std::scoped_lock<std::mutex> lock(m_cacheMutex);
+  m_imageData = data;
+  m_imageMimeType = mimeType;
+  m_cachedData[static_cast<int>(IClipboard::Format::Bitmap)] = bmp;
+  m_cachedAvailable[static_cast<int>(IClipboard::Format::Bitmap)] = !bmp.empty();
+  m_cached = true;
+  m_cachedTime = getCurrentTime();
 }
 
 IClipboard::Time WlClipboard::getCurrentTime() const
@@ -592,4 +742,6 @@ void WlClipboard::invalidateCache()
     m_cachedData[i].clear();
     m_cachedAvailable[i] = false;
   }
+  m_imageData.clear();
+  m_imageMimeType.clear();
 }

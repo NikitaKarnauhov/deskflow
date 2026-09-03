@@ -59,6 +59,11 @@ public:
   //! Read a format from the clipboard into \p data
   bool readPosix(Format format, std::string &data);
 
+  //! Read the image (if the selection offers any image/* type), cache it
+  //! and report whether it differs from the cached one. Does not spawn
+  //! wl-paste when no image type is present.
+  PosixCheckResult syncImagePosix();
+
   //! Store freshly read data in the cache
   void storeData(Format format, const std::string &data);
 
@@ -100,9 +105,19 @@ private:
   //! Invalidate cached clipboard data
   void invalidateCache();
 
-  //! Run wl-copy with the given arguments, waiting for it to finish.
-  //! Writes must be synchronous so a sequence of them applies in order.
-  bool runWlCopy(const QStringList &args) const;
+  //! Pick the most suitable image MIME type from the cached type list
+  //! (image/png preferred, then image/bmp, then any other image/*).
+  //! Empty if no image type is present.
+  std::string pickImageMimeType() const;
+
+  //! Cache image data: keep the original (for writing back to Wayland
+  //! with its native type) and the BMP conversion (for the protocol).
+  void storeImage(const std::string &mimeType, const std::string &data);
+
+  //! Run wl-copy with the given arguments, feeding \p data (which may be
+  //! binary) on standard input, and wait for it to finish. Writes must be
+  //! synchronous so a sequence of them applies in order.
+  bool runWlCopy(const QStringList &args, const std::string &data) const;
 
 private:
   ClipboardID m_id;
@@ -124,6 +139,13 @@ private:
   // constructor (server thread, before the worker starts) and by the
   // background worker afterwards.
   QStringList m_lastTypes;
+
+  // Original image data as offered by the clipboard and its MIME type.
+  // Kept separately from the BMP in m_cachedData so the image can be
+  // written back to the Wayland clipboard with a type Wayland apps
+  // actually request (image/png). Touched under m_cacheMutex.
+  mutable std::string m_imageData;
+  mutable std::string m_imageMimeType;
 
   // Clipboard selection type (true = clipboard, false = primary)
   bool m_useClipboard;

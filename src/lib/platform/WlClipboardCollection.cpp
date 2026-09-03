@@ -178,16 +178,28 @@ void WlClipboardCollection::workerLoop()
         m_clipboards[id]->storeData(IClipboard::Format::Text, text);
       }
 
+      // Image (if the selection offers any image/* type). Does not
+      // spawn wl-paste when there is no image.
+      auto imageResult = m_clipboards[id]->syncImagePosix();
+      if (imageResult == WlClipboard::PosixCheckResult::Failed) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        imageResult = m_clipboards[id]->syncImagePosix();
+      }
+      const bool imageChanged = imageResult == WlClipboard::PosixCheckResult::Changed;
+
       // DIAGNOSTIC
       LOG_INFO(
-          "diag: wl-clipboard check [%d]: types %s, text %s (%zu bytes)",
+          "diag: wl-clipboard check [%d]: types %s, text %s (%zu bytes), image %s",
           id,
           typesResult == WlClipboard::PosixCheckResult::Changed ? "CHANGED"
           : typesResult == WlClipboard::PosixCheckResult::Failed ? "READ FAILED"
           : "same",
-          textRead ? (textChanged ? "CHANGED" : "same") : "READ FAILED", text.size());
+          textRead ? (textChanged ? "CHANGED" : "same") : "READ FAILED", text.size(),
+          imageResult == WlClipboard::PosixCheckResult::Changed ? "CHANGED"
+          : imageResult == WlClipboard::PosixCheckResult::Failed ? "READ FAILED"
+          : "same");
 
-      result.changed[id] = typesChanged || textChanged || m_undelivered;
+      result.changed[id] = typesChanged || textChanged || imageChanged || m_undelivered;
     }
 
     bool anyChanged = false;
