@@ -212,6 +212,8 @@ PortalInputCapture::~PortalInputCapture()
     g_signal_handler_disconnect(m_session, m_signals.at(Deactivated));
     g_signal_handler_disconnect(m_session, m_signals.at(ZonesChanged));
 #ifdef HAVE_LIBPORTAL_CLIPBOARD
+    if (m_signals.at(SelectionOwnerChanged) != 0)
+      g_signal_handler_disconnect(parentSession, m_signals.at(SelectionOwnerChanged));
     g_signal_handler_disconnect(parentSession, m_signals.at(SelectionTransfer));
 #endif
     g_object_unref(m_session);
@@ -297,6 +299,42 @@ void PortalInputCapture::readClipboardSelection(XdpSession *session) const
 #endif
 }
 
+void PortalInputCapture::handleSelectionOwnerChanged(XdpSession *session, GStrv mimeTypes, gboolean isOwner) const
+{
+#ifdef HAVE_LIBPORTAL_CLIPBOARD
+  const auto constMimeTypes = const_cast<const char *const *>(mimeTypes);
+  LOG_DEBUG(
+      "selection owner changed, session owns: %s, mime types: %s",
+      isOwner ? "yes" : "no", mimeTypes ? PortalClipboard::formatMimeTypes(constMimeTypes).constData() : "(none)"
+  );
+
+  if (isOwner) {
+    LOG_DEBUG("ignoring selection owner change, session already owns the selection");
+    return;
+  }
+  if (!mimeTypes || !mimeTypes[0]) {
+    LOG_DEBUG("ignoring selection owner change, selection cleared");
+    return;
+  }
+
+  if (!PortalClipboard::pickSupportedMime(constMimeTypes)) {
+    LOG_DEBUG(
+        "ignoring selection owner change, no supported mime types: %s",
+        PortalClipboard::formatMimeTypes(constMimeTypes).constData()
+    );
+    return;
+  }
+
+  // A local application took ownership of the selection: read its contents
+  // into our cache and let the server share them with the clients.
+  readClipboardSelection(session);
+#else
+  (void)session;
+  (void)mimeTypes;
+  (void)isOwner;
+#endif
+}
+
 void PortalInputCapture::handleSelectionTransfer(XdpSession *session, const char *mimeType, uint32_t serial) const
 {
 #ifdef HAVE_LIBPORTAL_CLIPBOARD
@@ -353,6 +391,8 @@ void PortalInputCapture::setupSession(XdpInputCaptureSession *session)
   handleZonesChanged(session, nullptr);
 
 #ifdef HAVE_LIBPORTAL_CLIPBOARD
+  m_signals.at(SelectionOwnerChanged) =
+      g_signal_connect(G_OBJECT(parentSession), "selection-owner-changed", G_CALLBACK(selectionOwnerChanged), this);
   m_signals.at(SelectionTransfer) =
       g_signal_connect(G_OBJECT(parentSession), "selection-transfer", G_CALLBACK(selectionTransfer), this);
   if (m_clipboardClaimPending && xdp_session_is_clipboard_enabled(parentSession)) {

@@ -59,6 +59,7 @@ private:
   handleDeactivated(const XdpInputCaptureSession *session, const std::uint32_t activationId, const GVariant *options);
   void handleZonesChanged(XdpInputCaptureSession *session, const GVariant *options);
 
+  void handleSelectionOwnerChanged(XdpSession *session, GStrv mimeTypes, gboolean isOwner) const;
   void handleSelectionTransfer(XdpSession *session, const char *mimeType, uint32_t serial) const;
   void readClipboardSelection(XdpSession *session) const;
   void claimClipboardOwnership(XdpSession *session) const;
@@ -89,6 +90,10 @@ private:
   {
     static_cast<PortalInputCapture *>(data)->handleZonesChanged(session, options);
   }
+  static void selectionOwnerChanged(XdpSession *session, GStrv mimeTypes, gboolean isOwner, const gpointer data)
+  {
+    static_cast<PortalInputCapture *>(data)->handleSelectionOwnerChanged(session, mimeTypes, isOwner);
+  }
   static void selectionTransfer(XdpSession *session, const char *mimeType, uint32_t serial, const gpointer data)
   {
     static_cast<PortalInputCapture *>(data)->handleSelectionTransfer(session, mimeType, serial);
@@ -103,6 +108,7 @@ private:
     ZonesChanged,
 
     // Clipboard signals
+    SelectionOwnerChanged,
     SelectionTransfer,
   };
 
@@ -162,7 +168,7 @@ private:
       {Signal::SessionClosed, 0},     {Signal::Disabled, 0},     {Signal::Activated, 0},
       {Signal::Deactivated, 0},       {Signal::ZonesChanged, 0},
 
-      {Signal::SelectionTransfer, 0},
+      {Signal::SelectionOwnerChanged, 0}, {Signal::SelectionTransfer, 0},
   };
 
   bool m_enabled = false;
