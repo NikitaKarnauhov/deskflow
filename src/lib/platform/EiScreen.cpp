@@ -453,8 +453,19 @@ bool EiScreen::setClipboard(ClipboardID id, const IClipboard *clipboard)
   // Prefer the wl-clipboard backed clipboard when the tools are available:
   // it writes the real Wayland clipboard, unlike the in-memory cache.
   if (m_wlClipboard && m_wlClipboard->isAvailable()) {
-    if (auto targetClipboard = m_wlClipboard->getClipboard(id); targetClipboard)
-      return IClipboard::copy(targetClipboard, clipboard);
+    if (auto targetClipboard = m_wlClipboard->getClipboard(id); targetClipboard) {
+      if (clipboard) {
+        return IClipboard::copy(targetClipboard, clipboard);
+      }
+      // A null clipboard means asserting ownership (grab): claim the
+      // clipboard with empty content.
+      if (targetClipboard->open(0)) {
+        const bool ok = targetClipboard->empty();
+        targetClipboard->close();
+        return ok;
+      }
+      return false;
+    }
   }
 
   // If using portal input capture, set clipboard there

@@ -92,7 +92,7 @@ bool WlClipboard::empty()
   auto cmd = new QProcess(this);
   cmd->setProgram(s_copyApp);
   m_runningWlCopies.append(cmd);
-  connect(cmd, &QProcess::finished, this, [&] { m_runningWlCopies.removeAll(cmd); });
+  connect(cmd, &QProcess::finished, this, [this, cmd] { m_runningWlCopies.removeAll(cmd); });
 
   QStringList args = {s_noNewLine, ""};
   if (!m_useClipboard)
@@ -132,7 +132,7 @@ void WlClipboard::add(Format format, const std::string &data)
   cmd->setProgram(s_copyApp);
 
   m_runningWlCopies.append(cmd);
-  connect(cmd, &QProcess::finished, this, [&] { m_runningWlCopies.removeAll(cmd); });
+  connect(cmd, &QProcess::finished, this, [this, cmd] { m_runningWlCopies.removeAll(cmd); });
 
   QStringList args = {s_noNewLine, s_readType.arg(mimeType), QString::fromStdString(data)};
   if (!m_useClipboard)
