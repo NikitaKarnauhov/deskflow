@@ -20,6 +20,7 @@
 #include "platform/EiKeyState.h"
 #include "platform/PortalInputCapture.h"
 #include "platform/PortalRemoteDesktop.h"
+#include "platform/WlClipboardCollection.h"
 
 #include <algorithm>
 #include <cmath>
@@ -48,6 +49,7 @@ EiScreen::EiScreen(bool isPrimary, IEventQueue *events, bool usePortal)
 {
   initEi();
   m_keyState = new EiKeyState(this, events);
+  m_wlClipboard = new WlClipboardCollection();
   // install event handlers
   m_events->addHandler(EventTypes::System, m_events->getSystemTarget(), [this](const auto &e) {
     handleSystemEvent(e);
@@ -95,6 +97,7 @@ EiScreen::~EiScreen()
 
   delete m_keyState;
   delete m_clipboard;
+  delete m_wlClipboard;
 
   delete m_portalRemoteDesktop;
   delete m_portalInputCapture;
@@ -170,6 +173,13 @@ void *EiScreen::getEventTarget() const
 
 bool EiScreen::getClipboard(ClipboardID id, IClipboard *clipboard) const
 {
+  // Prefer the wl-clipboard backed clipboard when the tools are available:
+  // it reads the real Wayland clipboard, unlike the in-memory cache.
+  if (m_wlClipboard && m_wlClipboard->isAvailable()) {
+    if (const auto sourceClipboard = m_wlClipboard->getClipboard(id); sourceClipboard)
+      return IClipboard::copy(clipboard, sourceClipboard);
+  }
+
   // If using portal input capture, get clipboard from there
   if (m_portalInputCapture) {
     const auto sourceClipboard = m_portalInputCapture->getClipboard(id);
@@ -354,16 +364,16 @@ void EiScreen::fakeKey(uint32_t keycode, bool isDown) const
 
 void EiScreen::enable()
 {
-  // Nothing really to be done here
-  // Portal-based clipboard gets notifications via events
-  // Socket-based clipboard is passive (no monitoring needed)
+  if (m_wlClipboard && m_wlClipboard->isAvailable()) {
+    m_wlClipboard->startMonitoring();
+  }
 }
 
 void EiScreen::disable()
 {
-  // Nothing to do here
-  // Portal-based clipboard gets notifications via events
-  // Socket-based clipboard is passive (no monitoring needed)
+  if (m_wlClipboard && m_wlClipboard->isAvailable()) {
+    m_wlClipboard->stopMonitoring();
+  }
 }
 
 void EiScreen::cancelIdleEmulationTimer() const
@@ -443,6 +453,13 @@ void EiScreen::leave()
 
 bool EiScreen::setClipboard(ClipboardID id, const IClipboard *clipboard)
 {
+  // Prefer the wl-clipboard backed clipboard when the tools are available:
+  // it writes the real Wayland clipboard, unlike the in-memory cache.
+  if (m_wlClipboard && m_wlClipboard->isAvailable()) {
+    if (auto targetClipboard = m_wlClipboard->getClipboard(id); targetClipboard)
+      return IClipboard::copy(targetClipboard, clipboard);
+  }
+
   // If using portal input capture, set clipboard there
   if (m_portalInputCapture) {
     IClipboard *targetClipboard = m_portalInputCapture->getClipboard(id);
@@ -487,6 +504,16 @@ bool EiScreen::setClipboard(ClipboardID id, const IClipboard *clipboard)
 
 void EiScreen::checkClipboards()
 {
+  // With the wl-clipboard backend, detect local clipboard changes by
+  // polling and announce them so the server can share them with clients.
+  if (m_wlClipboard && m_wlClipboard->isAvailable() && m_wlClipboard->hasChanged()) {
+    for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
+      sendClipboardEvent(EventTypes::ClipboardChanged, id);
+    }
+    m_wlClipboard->resetChanged();
+    return;
+  }
+
   // For portal-based input capture, clipboard changes come via portal events
   // For socket-based, clipboard is passive and changes are sent explicitly
   // Nothing to do here

@@ -418,6 +418,16 @@ void PortalInputCapture::handleInitSession(GObject *object, GAsyncResult *res)
 
   m_session = session;
 
+#ifdef HAVE_LIBPORTAL_CLIPBOARD
+  // The v1 CreateSession API predates the session clipboard channel, but
+  // RequestClipboard is a per-session method that backends such as
+  // xdg-desktop-portal-gnome implement regardless of how the session was
+  // created. Portals advertising only version 1 (because the backend does
+  // not support CreateSession2) would otherwise leave the clipboard
+  // disabled, breaking clipboard sharing on Wayland.
+  xdp_session_request_clipboard(xdp_input_capture_session_get_session(session));
+#endif
+
   setupSession(session);
 }
 

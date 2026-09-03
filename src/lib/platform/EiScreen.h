@@ -30,6 +30,7 @@ class EiKeyState;
 class PortalRemoteDesktop;
 class PortalInputCapture;
 class EiClipboard;
+class WlClipboardCollection;
 
 using ClipboardInfo = IScreen::ClipboardInfo;
 
@@ -146,6 +147,7 @@ private:
 
   // clipboard stuff
   EiClipboard *m_clipboard = nullptr;
+  WlClipboardCollection *m_wlClipboard = nullptr;
   size_t m_maximumClipboardSize = INT_MAX;
 
   std::vector<ei_device *> m_eiDevices;
