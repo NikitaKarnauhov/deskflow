@@ -364,16 +364,13 @@ void EiScreen::fakeKey(uint32_t keycode, bool isDown) const
 
 void EiScreen::enable()
 {
-  if (m_wlClipboard && m_wlClipboard->isAvailable()) {
-    m_wlClipboard->startMonitoring();
-  }
+  // Clipboard change detection is on demand (see checkClipboards), no
+  // background monitoring to start.
 }
 
 void EiScreen::disable()
 {
-  if (m_wlClipboard && m_wlClipboard->isAvailable()) {
-    m_wlClipboard->stopMonitoring();
-  }
+  // No background monitoring to stop.
 }
 
 void EiScreen::cancelIdleEmulationTimer() const
@@ -504,13 +501,30 @@ bool EiScreen::setClipboard(ClipboardID id, const IClipboard *clipboard)
 
 void EiScreen::checkClipboards()
 {
-  // With the wl-clipboard backend, detect local clipboard changes by
-  // polling and announce them so the server can share them with clients.
-  if (m_wlClipboard && m_wlClipboard->isAvailable() && m_wlClipboard->hasChanged()) {
-    for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
-      sendClipboardEvent(EventTypes::ClipboardChanged, id);
+  // Called when the pointer leaves this screen. With the wl-clipboard
+  // backend, detect local clipboard changes by comparing the current MIME
+  // type list with the last seen one. This is on demand rather than
+  // timer-based because on compositors without ext-data-control
+  // (e.g. GNOME/mutter) each wl-paste invocation briefly maps a popup
+  // surface and steals focus.
+  if (m_wlClipboard && m_wlClipboard->isAvailable() && m_wlClipboard->refreshTypes()) {
+    if (m_isPrimary) {
+      // The primary screen first grabs (retakes) ownership of each
+      // clipboard, then announces the change so the server fetches the
+      // data and pushes it to the clients.
+      for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
+        sendClipboardEvent(EventTypes::ClipboardGrabbed, id);
+      }
+      for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
+        sendClipboardEvent(EventTypes::ClipboardChanged, id);
+      }
+    } else {
+      // A secondary screen announces ClipboardGrabbed; the client
+      // handles it and sends the data to the server (on leave).
+      for (ClipboardID id = 0; id < kClipboardEnd; ++id) {
+        sendClipboardEvent(EventTypes::ClipboardGrabbed, id);
+      }
     }
-    m_wlClipboard->resetChanged();
     return;
   }
 

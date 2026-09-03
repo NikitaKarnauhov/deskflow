@@ -50,34 +50,19 @@ bool WlClipboardCollection::hasChanged() const
   return false;
 }
 
-void WlClipboardCollection::startMonitoring()
+bool WlClipboardCollection::refreshTypes()
 {
-  if (!m_available || m_monitoring) {
-    return;
+  if (!m_available) {
+    return false;
   }
 
+  bool changed = false;
   for (const auto &clipboard : m_clipboards) {
-    if (clipboard) {
-      clipboard->startMonitoring();
+    if (clipboard && clipboard->refreshTypes()) {
+      changed = true;
     }
   }
-
-  m_monitoring = true;
-}
-
-void WlClipboardCollection::stopMonitoring()
-{
-  if (!m_available || !m_monitoring) {
-    return;
-  }
-
-  for (const auto &clipboard : m_clipboards) {
-    if (clipboard) {
-      clipboard->stopMonitoring();
-    }
-  }
-
-  m_monitoring = false;
+  return changed;
 }
 
 void WlClipboardCollection::resetChanged() const
@@ -122,10 +107,6 @@ void WlClipboardCollection::initialize()
 
 void WlClipboardCollection::cleanup()
 {
-  if (m_monitoring) {
-    stopMonitoring();
-  }
-
   m_clipboards.clear();
   m_available = false;
 }

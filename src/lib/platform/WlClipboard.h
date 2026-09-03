@@ -14,7 +14,6 @@
 #include <memory>
 #include <mutex>
 #include <string>
-#include <thread>
 
 #include <QObject>
 #include <QString>
@@ -43,11 +42,9 @@ public:
   //! Check if wl-clipboard tools are available
   static bool isAvailable();
 
-  //! Start monitoring clipboard changes
-  void startMonitoring();
-
-  //! Stop monitoring clipboard changes
-  void stopMonitoring();
+  //! Poll the current MIME type list once and report whether it changed
+  //! since the last check. Called when the pointer leaves the screen.
+  bool refreshTypes();
 
   //! Check if clipboard has changed
   bool hasChanged() const;
@@ -74,8 +71,9 @@ private:
   //! Get available MIME types from clipboard
   QStringList getAvailableMimeTypes() const;
 
-  //! Monitor clipboard changes in background thread
-  void monitorClipboard();
+  //! Compare the current MIME type list with the last seen one and update
+  //! the change flag (unless reportChange is false, for initial seeding)
+  void updateTypes(bool reportChange);
 
   //! Get current clipboard serial/timestamp
   Time getCurrentTime() const;
@@ -103,10 +101,8 @@ private:
   mutable std::string m_cachedData[static_cast<int>(Format::TotalFormats)];
   mutable bool m_cachedAvailable[static_cast<int>(Format::TotalFormats)];
 
-  // Background monitoring
-  std::unique_ptr<std::thread> m_monitorThread;
-  std::atomic<bool> m_monitoring = false;
-  std::atomic<bool> m_stopMonitoring = false;
+  // Last seen MIME type list, used for on-demand change detection
+  mutable QStringList m_lastTypes;
 
   // Clipboard selection type (true = clipboard, false = primary)
   bool m_useClipboard;

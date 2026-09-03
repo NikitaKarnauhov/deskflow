@@ -8,7 +8,6 @@
 
 #include "base/Log.h"
 
-#include <chrono>
 #include <fcntl.h>
 #include <poll.h>
 #include <spawn.h>
@@ -41,8 +40,6 @@ const char *const s_mimeTypeHtmlWindows = "HTML Format";
 
 // Command timeout (milliseconds)
 const int kCacheValidityMs = 100;
-const int kMonitorIntervalMs = 1000;
-const int kMaxConsecutiveErrors = 5;
 } // namespace
 
 WlClipboard::WlClipboard(ClipboardID id) : m_id(id), m_useClipboard(id == kClipboardClipboard)
@@ -51,11 +48,14 @@ WlClipboard::WlClipboard(ClipboardID id) : m_id(id), m_useClipboard(id == kClipb
   for (int i = 0; i < static_cast<int>(Format::TotalFormats); ++i) {
     m_cachedAvailable[i] = false;
   }
+
+  // Seed the known type list so the first refreshTypes() only reports
+  // an actual change
+  updateTypes(false);
 }
 
 WlClipboard::~WlClipboard()
 {
-  stopMonitoring();
   for (auto &cmd : m_runningWlCopies) {
     cmd->close();
     cmd->waitForFinished(100);
@@ -73,29 +73,10 @@ bool WlClipboard::isAvailable()
   return !QStandardPaths::findExecutable(s_copyApp).isEmpty() && !QStandardPaths::findExecutable(s_pasteApp).isEmpty();
 }
 
-void WlClipboard::startMonitoring()
+bool WlClipboard::refreshTypes()
 {
-  if (m_monitoring) {
-    return;
-  }
-  m_stopMonitoring = false;
-  m_monitoring = true;
-  m_monitorThread = std::make_unique<std::thread>(&WlClipboard::monitorClipboard, this);
-}
-
-void WlClipboard::stopMonitoring()
-{
-  if (!m_monitoring) {
-    return;
-  }
-
-  m_stopMonitoring = true;
-  m_monitoring = false;
-
-  if (m_monitorThread && m_monitorThread->joinable()) {
-    m_monitorThread->join();
-  }
-  m_monitorThread.reset();
+  updateTypes(true);
+  return m_hasChanged.load();
 }
 
 bool WlClipboard::hasChanged() const
@@ -331,42 +312,27 @@ QStringList WlClipboard::getAvailableMimeTypes() const
   return QString::fromLocal8Bit(cmd.readAll()).split(newLine);
 }
 
-void WlClipboard::monitorClipboard()
+void WlClipboard::updateTypes(bool reportChange)
 {
-  QStringList lastTypes;
-  int consecutiveErrors = 0;
+  // Note: this spawns "wl-paste --list-types" which, on compositors without
+  // ext-data-control (e.g. GNOME/mutter), briefly maps a popup surface and
+  // therefore steals focus. That is why change detection is on demand
+  // (pointer leaving the screen), not timer-based.
+  const auto currentTypes = getAvailableMimeTypes();
 
-  while (!m_stopMonitoring) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(kMonitorIntervalMs));
-    try {
-      // Check if clipboard content has changed by comparing available types
-      const auto currentTypes = getAvailableMimeTypes();
+  if (currentTypes == m_lastTypes) {
+    return;
+  }
 
-      // Reset error counter on successful operation
-      consecutiveErrors = 0;
+  m_lastTypes = currentTypes;
 
-      if (currentTypes != lastTypes) {
-        m_hasChanged = true;
-        lastTypes = currentTypes;
+  if (reportChange) {
+    m_hasChanged = true;
 
-        // Clear cache when clipboard changes
-        std::scoped_lock<std::mutex> lock(m_cacheMutex);
-        invalidateCache();
-        updateOwnership(false);
-      }
-    } catch (const std::exception &e) {
-      LOG_WARN("clipboard monitoring error: %s", e.what());
-      if (++consecutiveErrors >= kMaxConsecutiveErrors) {
-        LOG_ERR("too many consecutive errors in clipboard monitoring, stopping");
-        break;
-      }
-    } catch (...) {
-      LOG_WARN("clipboard monitoring unknown error");
-      if (++consecutiveErrors >= kMaxConsecutiveErrors) {
-        LOG_ERR("too many consecutive errors in clipboard monitoring, stopping");
-        break;
-      }
-    }
+    // Clear cache when clipboard changes
+    std::scoped_lock<std::mutex> lock(m_cacheMutex);
+    invalidateCache();
+    updateOwnership(false);
   }
 }
 

@@ -36,11 +36,9 @@ public:
   //! Check if any clipboard has changed
   bool hasChanged() const;
 
-  //! Start monitoring clipboard changes
-  void startMonitoring();
-
-  //! Stop monitoring clipboard changes
-  void stopMonitoring();
+  //! Poll the current MIME type lists once and report whether any changed
+  //! since the last check. Called when the pointer leaves the screen.
+  bool refreshTypes();
 
   //! Reset change detection
   void resetChanged() const;
@@ -55,7 +53,6 @@ private:
 private:
   std::vector<std::unique_ptr<WlClipboard>> m_clipboards;
   bool m_available = false;
-  bool m_monitoring = false;
 };
 
 } // namespace deskflow
