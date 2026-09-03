@@ -86,9 +86,14 @@ private:
   mutable std::mutex m_mutex;
   std::condition_variable m_cv;
   bool m_stop = false;
+  // A sync was requested, not yet consumed by the worker
   bool m_syncRequested = false;
-  // A request was consumed and its result is not yet delivered
-  bool m_syncActive = false;
+  // A request was consumed and its result was not yet delivered. Owned
+  // by the worker: it is set on consumption and cleared only at the top
+  // of the loop when no further request is pending, so a fetch of an
+  // older result can't clobber it while a new check is in flight.
+  bool m_syncInFlight = false;
+  // A result is ready and not yet fetched
   bool m_syncDone = false;
   // A changed result was produced but not yet consumed (the pointer
   // returned to the screen in the meantime); forces the next sync to

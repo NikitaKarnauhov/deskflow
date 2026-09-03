@@ -69,7 +69,7 @@ void WlClipboardCollection::requestLeaveSync()
 bool WlClipboardCollection::hasWork() const
 {
   std::scoped_lock<std::mutex> lock(m_mutex);
-  return m_syncActive || m_syncDone;
+  return m_syncRequested || m_syncInFlight || m_syncDone;
 }
 
 bool WlClipboardCollection::takeSyncResult(SyncResult &out)
@@ -79,10 +79,13 @@ bool WlClipboardCollection::takeSyncResult(SyncResult &out)
     return false;
   }
   m_syncDone = false;
-  m_syncActive = false;
   // The result is now delivered; any previously undelivered change is
   // superseded by (or re-sent through) it.
   m_undelivered = false;
+  // Note: m_syncInFlight is deliberately NOT touched here. If the worker
+  // already consumed a newer request while this (older) result sat in
+  // m_syncDone, clearing the in-flight state here would stop the polling
+  // timer and orphan the newer result.
   out = m_result;
   return true;
 }
@@ -91,12 +94,19 @@ void WlClipboardCollection::workerLoop()
 {
   for (;;) {
     std::unique_lock<std::mutex> lock(m_mutex);
+
+    // The previous iteration's result (if any) is either already fetched
+    // or still pending. Either way, no new request is pending here, so
+    // the in-flight window for it is over. Do this BEFORE waiting so a
+    // request that arrives in the meantime is not lost.
+    m_syncInFlight = false;
+
     m_cv.wait(lock, [this] { return m_stop || m_syncRequested; });
     if (m_stop) {
       break;
     }
     m_syncRequested = false;
-    m_syncActive = true;
+    m_syncInFlight = true;
 
     // Debounce: wait until the pointer is off the screen and a quiet
     // period has passed since the last request. New requests arriving in
@@ -121,7 +131,7 @@ void WlClipboardCollection::workerLoop()
     }
 
     if (cancelled) {
-      m_syncActive = false;
+      m_syncInFlight = false;
       break;
     }
 
@@ -203,7 +213,7 @@ void WlClipboardCollection::cleanup()
   {
     std::scoped_lock<std::mutex> lock(m_mutex);
     m_stop = true;
-    m_syncRequested = false;
+    m_syncRequested = true; // wake the worker
   }
   m_cv.notify_all();
 
