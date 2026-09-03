@@ -93,25 +93,20 @@ const std::string &wlCopyPath()
 
 // Run a command to completion and capture its standard output.
 //
+// Uses vfork + dup2 + execv rather than posix_spawn: glibc's
+// posix_spawn (clone3 with file actions) was observed to fail
+// intermittently with EBADF on the dup2 action (glibc 2.43, Fedora 44),
+// and the classic vfork path is fully deterministic, letting us check
+// the result of every dup2.
+//
 // Uses only POSIX APIs (no Qt), so it is safe to call from any thread,
 // in particular the background clipboard sync worker.
 bool runToolCapture(const std::vector<std::string> &argv, int timeoutMs, std::string &out)
 {
   int pipeFds[2];
   if (pipe(pipeFds) != 0) {
+    LOG_WARN("pipe failed for %s: %s", argv[0].c_str(), strerror(errno));
     return false;
-  }
-
-  int devnull = open("/dev/null", O_WRONLY);
-  posix_spawn_file_actions_t actions;
-  posix_spawn_file_actions_init(&actions);
-  posix_spawn_file_actions_adddup2(&actions, pipeFds[1], STDOUT_FILENO);
-  if (devnull >= 0) {
-    posix_spawn_file_actions_adddup2(&actions, devnull, STDERR_FILENO);
-  }
-  posix_spawn_file_actions_destroy(&actions);
-  if (devnull >= 0) {
-    close(devnull);
   }
 
   std::vector<char *> args;
@@ -121,54 +116,80 @@ bool runToolCapture(const std::vector<std::string> &argv, int timeoutMs, std::st
   }
   args.push_back(nullptr);
 
-  pid_t pid = -1;
-  bool ok = false;
-  const int spawnError = posix_spawn(&pid, argv[0].c_str(), &actions, nullptr, args.data(), environ);
-  if (spawnError != 0) {
-    LOG_WARN("posix_spawn(%s) failed: %s", argv[0].c_str(), strerror(spawnError));
-  } else {
-    close(pipeFds[1]);
-    pipeFds[1] = -1;
-
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
-    for (;;) {
-      struct pollfd pfd;
-      pfd.fd = pipeFds[0];
-      pfd.events = POLLIN;
-      pfd.revents = 0;
-
-      const int pollResult = poll(&pfd, 1, 200);
-      if (pollResult > 0) {
-        char buffer[8192];
-        const ssize_t bytes = read(pipeFds[0], buffer, sizeof(buffer));
-        if (bytes > 0) {
-          out.append(buffer, static_cast<size_t>(bytes));
-        } else if (bytes == 0) {
-          break; // EOF
-        } else if (errno != EINTR) {
-          break; // read error
-        }
-      } else if (pollResult < 0 && errno != EINTR) {
-        break;
-      }
-
-      if (std::chrono::steady_clock::now() > deadline) {
-        ::kill(pid, SIGKILL);
-        LOG_WARN("clipboard tool timed out: %s", argv[0].c_str());
-        break;
-      }
+  // vfork suspends the calling thread until the child execs or exits,
+  // so no other code in this thread can run in between. The child may
+  // only perform async-signal-safe operations before exec.
+  const pid_t pid = vfork();
+  if (pid < 0) {
+    LOG_WARN("vfork failed for %s: %s", argv[0].c_str(), strerror(errno));
+    ::close(pipeFds[0]);
+    ::close(pipeFds[1]);
+    return false;
+  }
+  if (pid == 0) {
+    // Child: stdout -> pipe, stderr -> /dev/null, then exec.
+    bool ok = ::dup2(pipeFds[1], STDOUT_FILENO) == STDOUT_FILENO;
+    const int devnull = ::open("/dev/null", O_WRONLY);
+    if (ok && devnull >= 0) {
+      ok = ::dup2(devnull, STDERR_FILENO) == STDERR_FILENO;
+      ::close(devnull);
     }
-    ok = true;
-
-    int status = 0;
-    waitpid(pid, &status, 0);
+    ::close(pipeFds[0]);
+    if (pipeFds[1] != STDOUT_FILENO) {
+      ::close(pipeFds[1]);
+    }
+    if (!ok) {
+      _exit(127);
+    }
+    ::execv(argv[0].c_str(), args.data());
+    _exit(127);
   }
 
-  if (pipeFds[1] >= 0) {
-    close(pipeFds[1]);
+  ::close(pipeFds[1]);
+
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+  for (;;) {
+    struct pollfd pfd;
+    pfd.fd = pipeFds[0];
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+
+    const int pollResult = poll(&pfd, 1, 200);
+    if (pollResult > 0) {
+      char buffer[8192];
+      const ssize_t bytes = read(pipeFds[0], buffer, sizeof(buffer));
+      if (bytes > 0) {
+        out.append(buffer, static_cast<size_t>(bytes));
+      } else if (bytes == 0) {
+        break; // EOF
+      } else if (errno != EINTR) {
+        break; // read error
+      }
+    } else if (pollResult < 0 && errno != EINTR) {
+      break;
+    }
+
+    if (std::chrono::steady_clock::now() > deadline) {
+      ::kill(pid, SIGKILL);
+      LOG_WARN("clipboard tool timed out: %s", argv[0].c_str());
+      break;
+    }
   }
-  close(pipeFds[0]);
-  return ok;
+
+  int status = 0;
+  waitpid(pid, &status, 0);
+  ::close(pipeFds[0]);
+
+  if (!WIFEXITED(status) || WEXITSTATUS(status) == 127) {
+    // 127 means the child bailed before exec (failed dup2 or missing
+    // binary); it produced no usable output.
+    LOG_WARN(
+        "%s failed to start (status %d)", argv[0].c_str(),
+        WIFEXITED(status) ? WEXITSTATUS(status) : (-WTERMSIG(status))
+    );
+    return false;
+  }
+  return true;
 }
 
 } // namespace
@@ -197,7 +218,7 @@ bool WlClipboard::isAvailable()
   return !QStandardPaths::findExecutable(s_copyApp).isEmpty() && !QStandardPaths::findExecutable(s_pasteApp).isEmpty();
 }
 
-bool WlClipboard::checkChangePosix()
+WlClipboard::PosixCheckResult WlClipboard::checkChangePosix()
 {
   const std::string &pastePath = wlPastePath();
   if (pastePath.empty()) {
@@ -213,7 +234,7 @@ bool WlClipboard::checkChangePosix()
 
   if (!runToolCapture(argv, kProcessTimeoutMs, raw)) {
     LOG_WARN("failed to read types of clipboard %d via wl-paste", m_id);
-    return false;
+    return PosixCheckResult::Failed;
   }
 
   QStringList current;
@@ -242,7 +263,7 @@ bool WlClipboard::checkChangePosix()
     m_cachedTime = getCurrentTime();
   }
 
-  return changed;
+  return changed ? PosixCheckResult::Changed : PosixCheckResult::Unchanged;
 }
 
 bool WlClipboard::readPosix(Format format, std::string &data)

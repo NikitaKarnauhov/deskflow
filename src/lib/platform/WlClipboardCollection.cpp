@@ -154,7 +154,13 @@ void WlClipboardCollection::workerLoop()
         continue;
       }
 
-      const bool typesChanged = m_clipboards[id]->checkChangePosix();
+      auto typesResult = m_clipboards[id]->checkChangePosix();
+      if (typesResult == WlClipboard::PosixCheckResult::Failed) {
+        // Transient spawn failure: retry once after a short pause.
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        typesResult = m_clipboards[id]->checkChangePosix();
+      }
+      const bool typesChanged = typesResult == WlClipboard::PosixCheckResult::Changed;
 
       std::string text;
       bool textChanged = false;
@@ -175,7 +181,10 @@ void WlClipboardCollection::workerLoop()
       // DIAGNOSTIC
       LOG_INFO(
           "diag: wl-clipboard check [%d]: types %s, text %s (%zu bytes)",
-          id, typesChanged ? "CHANGED" : "same",
+          id,
+          typesResult == WlClipboard::PosixCheckResult::Changed ? "CHANGED"
+          : typesResult == WlClipboard::PosixCheckResult::Failed ? "READ FAILED"
+          : "same",
           textRead ? (textChanged ? "CHANGED" : "same") : "READ FAILED", text.size());
 
       result.changed[id] = typesChanged || textChanged || m_undelivered;

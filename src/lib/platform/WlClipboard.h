@@ -53,7 +53,8 @@ public:
 
   //! Compare the current MIME type list with the last seen one, update
   //! the cache and report whether the clipboard changed
-  bool checkChangePosix();
+  enum class PosixCheckResult { Failed, Unchanged, Changed };
+  PosixCheckResult checkChangePosix();
 
   //! Read a format from the clipboard into \p data
   bool readPosix(Format format, std::string &data);
